@@ -2,14 +2,16 @@
 """Simulatore PAPER di due strategie sullo stesso replay.
 Nessun ordine reale.
 
-A) ARBITRAGGIO TAKER
-Compra Up e Down agli ask quando il profitto netto stimato supera
-la soglia configurata.
+A) TAKER: compra Up e Down agli ask quando il margine netto stimato
+dopo le commissioni supera la soglia configurata.
 
-B) LADDER MAKER
-Bid passivi su entrambi i lati. Il modello richiede un trade SELL
-a prezzo strettamente inferiore al nostro bid.
-Non modella la priorità reale in coda: P&L solo indicativo.
+B) MAKER: bid passivi. Un fill viene stimato solo se un trade SELL
+avviene a prezzo strettamente inferiore al nostro bid.
+
+ATTENZIONE:
+- La semantica di last_trade_price.side va verificata sul feed.
+- La priorità in coda maker non è modellata.
+- I risultati sono simulazioni, non garanzie di esecuzione.
 """
 from __future__ import annotations
 
@@ -36,7 +38,7 @@ class SimConfig:
     ladder_size: float = 5.0
     quote_from_s: float = 5.0
     cancel_before_end_s: float = 60.0
-    fill_on_equal: bool = False  # mantenuto per compatibilità
+    fill_on_equal: bool = False
 
 
 def simulate_window(meta, events, cfg: SimConfig):
@@ -66,6 +68,7 @@ def simulate_window(meta, events, cfg: SimConfig):
         "pnl": 0.0,
         "events": 0,
         "since": None,
+        "counted": False,
         "best_sum": None,
         "below1_ms": 0,
         "below_net_ms": 0,
@@ -78,19 +81,19 @@ def simulate_window(meta, events, cfg: SimConfig):
 
     def reset_arb_persistence():
         arb["since"] = None
+        arb["counted"] = False
         arb["last_ts"] = None
         arb["was_below1"] = False
         arb["was_net_positive"] = False
 
     def evaluate(ts):
-        """Valuta il book una volta per timestamp, dopo tutti gli eventi
-        dello stesso timestamp."""
+        """Valuta il book dopo aver applicato gli eventi del timestamp."""
         t = (ts - t0) / 1000.0
 
         ba_u = books[up].best_ask()
         ba_d = books[down].best_ask()
 
-        in_arb_window = cfg.arb_from_s <= t <= cfg.arb_until_s
+        in_window = cfg.arb_from_s <= t <= cfg.arb_until_s
 
         valid_books = (
             ba_u is not None
@@ -104,7 +107,7 @@ def simulate_window(meta, events, cfg: SimConfig):
         # ---------------------------------------------------------
         # A) ARBITRAGGIO TAKER
         # ---------------------------------------------------------
-        if in_arb_window and valid_books:
+        if in_window and valid_books:
             ask_u = float(ba_u[0])
             qty_u = float(ba_u[1])
             ask_d = float(ba_d[0])
@@ -119,11 +122,11 @@ def simulate_window(meta, events, cfg: SimConfig):
                 arb["best_sum"] = ask_sum
 
             gross_edge = 1.0 - ask_sum
-            fee_per_pair = (
+            fees = (
                 taker_fee(1.0, ask_u, cfg.fee_rate)
                 + taker_fee(1.0, ask_d, cfg.fee_rate)
             )
-            net_per_pair = gross_edge - fee_per_pair
+            net_per_pair = gross_edge - fees
 
             previous_ts = arb["last_ts"]
             gap_ok = (
@@ -152,6 +155,7 @@ def simulate_window(meta, events, cfg: SimConfig):
             if net_per_pair >= cfg.arb_margin:
                 if arb["since"] is None or not gap_ok:
                     arb["since"] = ts
+                    arb["counted"] = False
 
                 persistence_ok = (
                     ts - arb["since"] >= cfg.arb_persist_ms
@@ -161,19 +165,22 @@ def simulate_window(meta, events, cfg: SimConfig):
                     cfg.arb_shares_cap - arb["shares"]
                 )
 
-                if persistence_ok and remaining_cap > 1e-9:
+                # Una contabilizzazione per opportunità continua.
+                if (
+                    persistence_ok
+                    and not arb["counted"]
+                    and remaining_cap > 1e-9
+                ):
                     q = min(qty_u, qty_d, remaining_cap)
 
                     if q > 1e-9:
                         arb["shares"] += q
                         arb["pnl"] += q * net_per_pair
                         arb["events"] += 1
-
-                        # Nuova persistenza prima della prossima
-                        # contabilizzazione.
-                        arb["since"] = ts
+                        arb["counted"] = True
             else:
                 arb["since"] = None
+                arb["counted"] = False
 
             arb["last_ts"] = ts
 
@@ -199,14 +206,16 @@ def simulate_window(meta, events, cfg: SimConfig):
                 for price in cfg.ladder:
                     p = float(price)
 
-                    # Post-only: mai attraversare lo spread.
-                    if p > 0 and p < ask_price:
+                    # Post-only: non attraversare lo spread.
+                    if (
+                        p > 0
+                        and p < ask_price
+                        and cfg.ladder_size > 0
+                    ):
                         state["orders"].append({
                             "tok": tok,
                             "price": p,
-                            "rem": max(
-                                0.0, float(cfg.ladder_size)
-                            ),
+                            "rem": float(cfg.ladder_size),
                         })
 
             state["placed"] = True
@@ -231,7 +240,6 @@ def simulate_window(meta, events, cfg: SimConfig):
         except (TypeError, ValueError):
             continue
 
-        # Valuta il timestamp precedente prima di passare al nuovo.
         if dirty and last_ts is not None and ts != last_ts:
             evaluate(last_ts)
             dirty = False
@@ -277,8 +285,7 @@ def simulate_window(meta, events, cfg: SimConfig):
             except (TypeError, ValueError, KeyError):
                 continue
 
-            # ASSUNZIONE: side=SELL identifica una vendita aggressiva
-            # che può colpire i nostri bid. Va verificata sul feed.
+            # Ipotesi da verificare: SELL identifica il lato aggressore.
             side = str(ev.get("side", "")).upper()
 
             if side == "SELL" and trade_size > 0:
@@ -291,29 +298,26 @@ def simulate_window(meta, events, cfg: SimConfig):
                     key=lambda order: -order["price"],
                 )
 
-                remaining_trade_size = trade_size
+                remaining_size = trade_size
 
                 for order in candidates:
-                    # Fill solo se il trade avviene sotto il bid.
-                    if not trade_price < order["price"]:
+                    if remaining_size <= 1e-9:
+                        break
+
+                    # Prezzo strettamente inferiore al nostro bid.
+                    if trade_price >= order["price"]:
                         continue
 
-                    if (
-                        order["rem"] <= 1e-9
-                        or remaining_trade_size <= 1e-9
-                    ):
+                    if order["rem"] <= 1e-9:
                         continue
 
-                    q = min(
-                        order["rem"],
-                        remaining_trade_size,
-                    )
+                    q = min(order["rem"], remaining_size)
 
                     if q <= 1e-9:
                         continue
 
                     order["rem"] -= q
-                    remaining_trade_size -= q
+                    remaining_size -= q
 
                     inv[tok] += q
                     fill_cost = q * order["price"]
@@ -328,13 +332,13 @@ def simulate_window(meta, events, cfg: SimConfig):
             ]
 
         elif event_type == "market_resolved":
-            resolved_token = ev.get("winning_asset_id")
+            token = ev.get("winning_asset_id")
 
-            if resolved_token is not None:
-                resolved_token = str(resolved_token)
+            if token is not None:
+                token = str(token)
 
-                if resolved_token in (up, down):
-                    winner = resolved_token
+                if token in (up, down):
+                    winner = token
 
     if dirty and last_ts is not None:
         evaluate(last_ts)
@@ -345,12 +349,13 @@ def simulate_window(meta, events, cfg: SimConfig):
     up_qty = inv[up]
     down_qty = inv[down]
     resolved = winner in (up, down)
+    pairs = min(up_qty, down_qty)
 
     result = {
         "start": start,
         "resolved": resolved,
 
-        # Taker: stima al netto delle fee configurate.
+        # Taker: P&L teorico netto delle fee configurate.
         "arb_shares": round(arb["shares"], 6),
         "arb_pnl": round(arb["pnl"], 6),
         "arb_events": arb["events"],
@@ -362,15 +367,13 @@ def simulate_window(meta, events, cfg: SimConfig):
         "ms_ask_sum_below_1": arb["below1_ms"],
         "ms_net_opportunity": arb["below_net_ms"],
 
-        # Maker: risultato indicativo, coda non modellata.
+        # Maker: stima; priorità in coda non modellata.
         "fills": maker_fills,
         "cost": round(maker_cost, 6),
         "up_qty": round(up_qty, 6),
         "down_qty": round(down_qty, 6),
-        "pairs": round(min(up_qty, down_qty), 6),
-        "leftover_shares": round(
-            abs(up_qty - down_qty), 6
-        ),
+        "pairs": round(pairs, 6),
+        "leftover_shares": round(abs(up_qty - down_qty), 6),
         "maker_pnl": None,
         "pair_pnl": None,
         "leftover_pnl": None,
@@ -382,12 +385,10 @@ def simulate_window(meta, events, cfg: SimConfig):
     }
 
     if resolved:
-        # Una share vincente paga 1; una perdente paga 0.
-        gross_redemption = inv[winner]
-        maker_pnl = gross_redemption - maker_cost
-        pairs = min(up_qty, down_qty)
+        # Il token vincente paga 1 per share, il perdente 0.
+        redemption = inv[winner]
+        maker_pnl = redemption - maker_cost
 
-        # Ripartizione contabile usando il costo medio per token.
         avg_up_cost = (
             cost_by_token[up] / up_qty
             if up_qty > 0
