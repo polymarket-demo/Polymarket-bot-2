@@ -1,100 +1,199 @@
+
 """Legge file JSONL e restituisce gli eventi ordinati per finestra di 5 minuti."""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _market_start(meta):
+    """Compatibilità tra lo schema vecchio e quello nuovo."""
+    value = meta.get("start", meta.get("market_start"))
+
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_tokens(meta):
+    """Restituisce gli ID token UP e DOWN dai due schemi."""
+    up = meta.get("up", meta.get("up_token_id"))
+    down = meta.get("down", meta.get("down_token_id"))
+
+    return (
+        str(up) if up is not None else None,
+        str(down) if down is not None else None,
+    )
 
 
 def event_tokens(ev):
-    if "asset_id" in ev:
-        return [str(ev["asset_id"])]
+    """Estrae tutti gli asset ID riconoscibili da un evento CLOB."""
+    tokens = set()
 
-    if "price_changes" in ev:
-        return list({
-            str(c["asset_id"])
-            for c in ev["price_changes"]
-        })
+    asset_id = ev.get("asset_id")
+    if asset_id is not None:
+        tokens.add(str(asset_id))
 
-    return [
-        str(a)
-        for a in (ev.get("assets_ids") or ev.get("asset_ids") or [])
-    ]
+    # Formato standard dei messaggi price_change.
+    changes = ev.get("price_changes")
+    if isinstance(changes, list):
+        for change in changes:
+            if isinstance(change, dict):
+                token = change.get("asset_id")
+                if token is not None:
+                    tokens.add(str(token))
+
+    # Formati alternativi: snapshot o messaggio di sottoscrizione.
+    for key in ("assets_ids", "asset_ids"):
+        values = ev.get(key)
+        if isinstance(values, list):
+            tokens.update(str(value) for value in values if value is not None)
+
+    return sorted(tokens)
 
 
 def event_ts(ev, rx):
+    """
+    Restituisce il timestamp dell'evento in millisecondi, se presente.
+    Altrimenti usa rx, che nel JSONL del recorder è in secondi.
+    """
+    value = ev.get("timestamp")
+
+    if value is None:
+        return rx
+
     try:
-        return int(ev["timestamp"])
-    except (KeyError, TypeError, ValueError):
+        return int(value)
+    except (TypeError, ValueError):
         return rx
 
 
+def _read_json_lines(path):
+    """Legge le righe JSON valide senza interrompersi su righe corrotte."""
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(obj, dict):
+                yield obj
+
+
 def load_windows(paths):
-    metas, tok2start, events = {}, {}, {}
+    """
+    Restituisce [(metadata, eventi), ...], ordinati per finestra.
 
-    for p in paths:
-        with open(p) as f:
-            for line in f:
-                try:
-                    o = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    Formato record supportato:
+        {"rx": ..., "meta": {...}}
+        {"rx": ..., "ev": {...}}
 
-                if "meta" in o:
-                    m = o["meta"]
-                    metas[m["start"]] = m
-                    tok2start[str(m["up"])] = m["start"]
-                    tok2start[str(m["down"])] = m["start"]
+    I metadati possono usare:
+        start/up/down
+    oppure:
+        market_start/up_token_id/down_token_id
+    """
+    metas = {}
+    tok2start = {}
+    events = {}
 
-                elif "ev" in o:
-                    ev = o["ev"]
-                    st = next(
-                        (
-                            tok2start[t]
-                            for t in event_tokens(ev)
-                            if t in tok2start
-                        ),
-                        None,
-                    )
+    # Prima passata: carica tutti i metadati.
+    # In questo modo gli eventi restano associabili anche se i file
+    # contengono record provenienti da più finestre.
+    for path in paths:
+        for obj in _read_json_lines(path):
+            meta = obj.get("meta")
 
-                    if st is not None:
-                        events.setdefault(st, []).append(
-                            (event_ts(ev, o["rx"]), o["rx"], ev)
-                        )
+            if not isinstance(meta, dict):
+                continue
 
-    out = []
+            start = _market_start(meta)
+            up, down = _market_tokens(meta)
 
-    for st in sorted(metas):
-        evs = sorted(
-            events.get(st, []),
-            key=lambda x: (x[0], x[1]),
+            if start is None or up is None or down is None:
+                continue
+
+            normalized = dict(meta)
+            normalized["start"] = start
+            normalized["up"] = up
+            normalized["down"] = down
+
+            metas[start] = normalized
+            tok2start[up] = start
+            tok2start[down] = start
+
+    # Seconda passata: associa gli eventi ai token dei mercati.
+    for path in paths:
+        for obj in _read_json_lines(path):
+            ev = obj.get("ev")
+
+            if not isinstance(ev, dict):
+                continue
+
+            rx = obj.get("rx", 0)
+
+            try:
+                rx = float(rx)
+            except (TypeError, ValueError):
+                continue
+
+            starts = {
+                tok2start[token]
+                for token in event_tokens(ev)
+                if token in tok2start
+            }
+
+            # Un evento con un token noto appartiene alla relativa finestra.
+            # Se contiene più token di finestre diverse, viene associato
+            # a ciascuna finestra riconosciuta.
+            for start in starts:
+                events.setdefault(start, []).append(
+                    (event_ts(ev, rx), rx, ev)
+                )
+
+    output = []
+
+    for start in sorted(metas):
+        ordered_events = sorted(
+            events.get(start, []),
+            key=lambda item: (item[0], item[1]),
         )
-        out.append((metas[st], evs))
+        output.append((metas[start], ordered_events))
 
-    return out
+    return output
 
 
 def load_refs(paths):
-    """Restituisce una serie ordinata di (timestamp_ms, prezzo)."""
-    out = []
+    """Restituisce una serie ordinata di (timestamp_ms, prezzo BTC)."""
+    output = []
 
-    for p in paths:
-        with open(p) as f:
-            for line in f:
-                if '"ref"' not in line:
-                    continue
+    for path in paths:
+        for obj in _read_json_lines(path):
+            ref = obj.get("ref")
 
-                try:
-                    o = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            if not isinstance(ref, dict):
+                continue
 
-                r = o.get("ref")
+            try:
+                timestamp = int(ref.get("T") or float(obj["rx"]) * 1000)
+                price = float(ref["p"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
 
-                if r:
-                    out.append((
-                        int(r.get("T") or o["rx"]),
-                        float(r["p"]),
-                    ))
+            if price <= 0:
+                continue
 
-    out.sort()
-    return out
+            output.append((timestamp, price))
+
+    output.sort(key=lambda item: item[0])
+    return output
